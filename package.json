@@ -1,0 +1,53 @@
+{
+  "name": "@fotohub/shoper-app",
+  "version": "1.0.0",
+  "description": "FOTOhub AI dla Shoper — masowe generowanie zdjęć produktowych, usuwanie tła, opisy AI, workflow szkiców (draft-first), oparty o FOTOhub commerce-bridge / FOTOhub AI for Shoper — bulk product photo generation, background removal, AI copywriting, draft-first review workflow",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "dev": "tsc && node dist/server.js"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.22.2",
+    "undici": "^6.28.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^4.17.25",
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fotohubapp/shoper-app.git"
+  },
+  "keywords": [
+    "shoper",
+    "fotohub",
+    "ai",
+    "zdjecia-produktowe",
+    "product-photos",
+    "image-generation",
+    "background-removal",
+    "opisy-produktow",
+    "ai-copywriting",
+    "seo",
+    "e-commerce",
+    "allegro",
+    "alt-text",
+    "upscale"
+  ],
+  "files": [
+    "dist",
+    "public",
+    "README.md"
+  ]
+}
