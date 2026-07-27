@@ -38,8 +38,15 @@ Mała aplikacja serwerowa (Node.js + TypeScript) z panelem w przeglądarce, któ
    - `SHOPER_STORE_URL` — adres sklepu, np. `https://sklep123456.shoparena.pl`,
    - `SHOPER_ACCESS_TOKEN` — stały token webapi, **albo** `SHOPER_LOGIN` + `SHOPER_PASSWORD` (aplikacja sama pobierze token przez `POST /webapi/rest/auth` i odświeży go po wygaśnięciu),
    - `FOTOHUB_API_KEY` — klucz z panelu FOTOhub (https://fotohub.app → Console → API Keys),
-   - `FOTOHUB_CONFIG_SECRET` — dowolne długie hasło szyfrujące lokalny magazyn sekretów,
+   - `FOTOHUB_CONFIG_SECRET` — hasło szyfrujące lokalny magazyn sekretów, **wymagane**, minimum 16 znaków (`openssl rand -hex 32`); bez niego aplikacja nie wystartuje,
+   - `ADMIN_TOKEN` — wspólny sekret wymagany na każdym wywołaniu `/api`. Puste = **panel bez uwierzytelnienia**: każdy, kto dosięgnie portu, może wydawać kredyty i zapisywać do sklepu. Ustaw go zawsze, gdy `HOST` nie jest `127.0.0.1` (dotyczy też Dockera),
    - `PUBLIC_URL` — publiczny adres tej aplikacji (dla webhooków bridge), jeśli dostępny.
+
+Warianty produktu: opcja **Uwzględnij warianty produktu** przekazuje AI listę
+kombinacji opcji (rozmiary, kolory), więc opisy mogą się do nich odnosić. Shoper
+przechowuje zdjęcia **na poziomie produktu**, nie wariantu — nowe zdjęcie trafia
+do galerii produktu, a nazwa wariantu tylko do tekstu ALT. Szczegóły w sekcji
+angielskiej niżej.
 3. Zainstaluj i uruchom:
 
 ```bash
@@ -121,13 +128,78 @@ docker run -p 8811:8811 --env-file .env -v fotohub-shoper-data:/app/data fotohub
 | `SHOPER_ACCESS_TOKEN` | yes*/or | Permanent webapi token |
 | `SHOPER_LOGIN` / `SHOPER_PASSWORD` | yes*/or | Webapi user credentials (auto token refresh) |
 | `FOTOHUB_API_KEY` | yes* | `fh_live_...` / `fh_test_...` key |
-| `FOTOHUB_CONFIG_SECRET` | recommended | Passphrase for the encrypted config store |
+| `FOTOHUB_CONFIG_SECRET` | **yes** | Passphrase encrypting the config store. The app refuses to start without at least 16 characters — there is no default, because a shipped fallback would encrypt every install's credentials with the same public constant. Generate with `openssl rand -hex 32`. |
+| `ADMIN_TOKEN` | recommended | Shared secret required on every `/api` call. **Unset means the panel is unauthenticated.** |
+| `TRUST_PROXY` | no | Set to `1` only behind a reverse proxy you control (see below) |
 | `PUBLIC_URL` | no | Public base URL for webhook callbacks |
 | `PORT` | no | Default `8811` |
 | `HOST` | no | Default `127.0.0.1` (set `0.0.0.0` in Docker) |
 | `DATA_DIR` | no | SQLite location, default `./data` |
 
 \* every value can instead be entered in the connection wizard.
+
+### Access control
+
+The panel drives a merchant's live catalogue and spends FOTOhub credits, so
+reaching the port is equivalent to holding the store's credentials. There are two
+layers:
+
+- **`ADMIN_TOKEN` (shared secret).** When set, every `/api` request must present
+  it as `Authorization: Bearer <token>` or `X-Admin-Token: <token>`; anything
+  else gets `401`. The gate runs before the CSRF check, so an unauthenticated
+  caller cannot even read the panel's state or collect a CSRF token.
+- **CSRF token.** Issued per process by `GET /api/status` and required in
+  `X-CSRF-Token` on every mutating request. This stops a cross-site page, but it
+  is *not* access control: any client that can reach the port can simply read the
+  token from `/api/status`.
+
+When `ADMIN_TOKEN` is unset the app keeps working and logs a warning at boot,
+because forcing a token on upgrade would lock an existing merchant out of their
+own panel. In that configuration binding to `127.0.0.1` is the only thing
+protecting the store — so set a token whenever `HOST` is not loopback (including
+Docker, where `HOST` is typically `0.0.0.0`).
+
+### Rate limits
+
+Mutating `/api` routes are throttled per client address, per minute, because each
+one costs either a Shoper round trip or real credits:
+
+| Bucket | Routes | Budget |
+|--------|--------|--------|
+| spend | job submit, retry-failed, draft approve/reject/approve-all | 20/min |
+| connect | `/api/connect`, `/api/disconnect` | 10/min |
+| mutation | settings, language, default preset, validate-key | 60/min |
+
+Reads are not throttled (the dashboard polls them). Over budget returns `429`
+with a `Retry-After` header in seconds plus `retry_after_ms` in the body.
+
+The limiter keys on the socket address. `X-Forwarded-For` is honoured **only**
+when `TRUST_PROXY=1`; enabling it without a trusted proxy in front lets any
+client forge a fresh quota per request.
+
+### Product variants (`include_variants`)
+
+Set `include_variants: true` on `POST /api/jobs`, or tick **Uwzględnij warianty
+produktu** / **Include product variants** in the job wizard, to fold a product's
+option combinations into the context sent to the model.
+
+What a merchant gets:
+
+- the variant list (e.g. `Rozmiar: 42, Kolor: czerwony`) is read from
+  `/product-stocks` and joined with human-readable option and value labels, so
+  generated copy can reference real sizes and colours instead of inventing them,
+- inactive variants are excluded when at least one is active,
+- one extra Shoper request per product; if the webapi user lacks the
+  `/product-stocks` permission the lookup is skipped rather than failing the job.
+
+What it does **not** do:
+
+- it does not attach a generated photo to an individual variant. Shoper stores
+  images **per product**, not per `product-stocks` row, so a variant photo is
+  uploaded to the parent product's gallery with the option combination folded
+  into its ALT text. There is no per-variant image slot to write to.
+- it does not write variant-specific descriptions; text write-back always targets
+  the product translation.
 
 ### API docs
 

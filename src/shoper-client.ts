@@ -15,8 +15,10 @@
  *    honouring Retry-After and pushing the penalty onto the shared bucket so
  *    every queued caller backs off, not just the unlucky one,
  *  - per-request timeout via AbortSignal,
- *  - typed errors (ShoperAuthError / ShoperRateLimitError / ShoperNotFound /
- *    ShoperValidationError / ShoperTransportError),
+ *  - typed errors (ShoperAuthError / ShoperPermissionError /
+ *    ShoperRateLimitError / ShoperNotFound / ShoperValidationError /
+ *    ShoperTransportError). A 403 is a permission problem, never a stale
+ *    token, so it is reported as such and never triggers a refresh.
  *  - request/response log hooks with API-key + Authorization redaction,
  *  - opt-in ETag/If-None-Match caching for GETs (Shoper sends ETags on some
  *    collections; a 304 replays the cached body at zero parse cost).
@@ -59,6 +61,7 @@ import {
   ShoperNotFound,
   ShoperOption,
   ShoperOptionValue,
+  ShoperPermissionError,
   ShoperProducer,
   ShoperProduct,
   ShoperProductImage,
@@ -314,8 +317,11 @@ export class ShoperClient {
             parsed && "error_description" in parsed && parsed.error_description
               ? String(parsed.error_description)
               : "no token returned";
+          // The store's own error text is echoed here, and a misconfigured
+          // store can echo the credential straight back, so it goes through
+          // the same redaction as every other error path.
           throw new ShoperAuthError(
-            `Shoper auth failed (${response.status}): ${detail}`,
+            redact(`Shoper auth failed (${response.status}): ${detail}`),
             response.status || 401,
             body
           );
@@ -458,8 +464,12 @@ export class ShoperClient {
       }
 
       // Expired/rejected token: re-authenticate once (only when we own creds).
+      // Deliberately 401 only. In Shoper a 403 means the webapi user lacks the
+      // permission for this resource, so re-authenticating would spend an extra
+      // round trip, return the same 403, and bury the real cause behind an
+      // auth-looking error.
       if (
-        (response.status === 401 || response.status === 403) &&
+        response.status === 401 &&
         !options.retriedAuth &&
         !this.tokenIsStatic &&
         this.login &&
@@ -528,7 +538,15 @@ export class ShoperClient {
   ): ShoperApiError {
     const detail = extractErrorDetail(body) ?? rawText.slice(0, 300);
     const message = redact(`Shoper ${method} ${path} failed with ${status}: ${detail}`);
-    if (status === 401 || status === 403) return new ShoperAuthError(message, status, body);
+    if (status === 403) {
+      return new ShoperPermissionError(
+        `${message} — insufficient permission: the Shoper webapi user cannot ` +
+          `access ${path}. Grant it in the Shoper admin under the webapi user's ` +
+          `permission list (this is not a token problem).`,
+        body
+      );
+    }
+    if (status === 401) return new ShoperAuthError(message, status, body);
     if (status === 404) return new ShoperNotFound(message, body);
     if (status === 429) {
       return new ShoperRateLimitError(message, parseRetryAfter(retryAfter) ?? 1000, body);

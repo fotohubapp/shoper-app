@@ -274,6 +274,9 @@ const pl: Strings = {
   option_fields_help: "Wybierz co najmniej jedno pole.",
   option_preset: "Preset",
   option_preset_none: "Bez presetu",
+  option_include_variants: "Uwzględnij warianty produktu",
+  option_include_variants_help:
+    "Przekaże AI listę wariantów (np. rozmiary, kolory), więc opisy i zdjęcia będą je uwzględniać. Shoper przechowuje zdjęcia na poziomie produktu, więc nowe zdjęcie trafia do galerii produktu, a nazwa wariantu do tekstu ALT — nie do pojedynczego wariantu. Wymaga jednego dodatkowego zapytania na produkt.",
   tone_professional: "Profesjonalny",
   tone_casual: "Swobodny",
   tone_luxury: "Luksusowy",
@@ -713,6 +716,9 @@ const en: Strings = {
   option_fields_help: "Pick at least one field.",
   option_preset: "Preset",
   option_preset_none: "No preset",
+  option_include_variants: "Include product variants",
+  option_include_variants_help:
+    "Passes the variant list (sizes, colours) to the AI so copy and photos account for them. Shoper stores images per product, so a new image lands in the product gallery with the variant name in its ALT text, not on the individual variant. Costs one extra request per product.",
   tone_professional: "Professional",
   tone_casual: "Casual",
   tone_luxury: "Luxury",

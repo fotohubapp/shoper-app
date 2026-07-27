@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * FOTOhub AI for Shoper — admin server.
  *
@@ -18,17 +19,21 @@
  *  FOTOHUB_CONFIG_SECRET   passphrase for the encrypted config store
  *  PUBLIC_URL              externally reachable base URL (webhook callbacks)
  *  DATA_DIR                where the SQLite DB lives (default ./data)
+ *  ADMIN_TOKEN             shared secret required on /api (optional)
+ *  TRUST_PROXY             "1" when behind a reverse proxy (X-Forwarded-For)
  *
  * Values entered through the connection wizard are stored encrypted in
  * SQLite and take precedence over env values.
  */
 
-import { randomBytes } from "crypto";
+import { randomBytes, timingSafeEqual } from "crypto";
 import express, { NextFunction, Request, Response } from "express";
 import { join } from "path";
 import { CommerceBridgeClient } from "./bridge-client";
 import { DraftStore } from "./draft-store";
+import { FixedWindowRateLimiter } from "./http";
 import { getStrings } from "./i18n";
+import { summariseVariants } from "./product-context";
 import { ShoperClient } from "./shoper-client";
 import { collectJobDrafts, createWebhookRouter } from "./webhook";
 import {
@@ -43,6 +48,7 @@ import {
   PresetCategory,
   ProductContext,
   ProductSort,
+  ShoperPermissionError,
   ShoperProductTranslation,
   TONES,
 } from "./types";
@@ -51,8 +57,113 @@ const PORT = Number(process.env["PORT"] ?? 8811);
 const HOST = process.env["HOST"] ?? "127.0.0.1";
 const PUBLIC_DIR = join(__dirname, "..", "public");
 const DATA_DIR = process.env["DATA_DIR"] ?? join(process.cwd(), "data");
+const TRUST_PROXY = process.env["TRUST_PROXY"] === "1";
 const LOW_BALANCE_THRESHOLD = 50;
 const MISSING_DESCRIPTION_MAX = 20;
+
+/* -------------------------------------------------------------------- */
+/* Rate limiting                                                         */
+/* -------------------------------------------------------------------- */
+
+export const RATE_LIMIT_WINDOW_MS = 60_000;
+/**
+ * Per-IP budgets per minute. A mutation costs a Shoper round trip or FOTOhub
+ * credits, so it is far scarcer than a read. Submitting jobs and approving
+ * drafts are metered hardest because each one spends real money.
+ */
+export const RATE_LIMITS = {
+  /** Anything that spends credits or writes to the live store. */
+  spend: 20,
+  /** Connection wizard / disconnect: rare, and each one hits two APIs. */
+  connect: 10,
+  /** Other mutations (settings, language, preset default). */
+  mutation: 60,
+} as const;
+
+const spendLimiter = new FixedWindowRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMITS.spend,
+});
+const connectLimiter = new FixedWindowRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMITS.connect,
+});
+const mutationLimiter = new FixedWindowRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMITS.mutation,
+});
+
+/**
+ * Which bucket a mutating path draws from. Ordered longest-prefix-first so
+ * /api/jobs/:id/cancel is classified before the bare /api/jobs prefix.
+ */
+export function limiterFor(path: string): FixedWindowRateLimiter {
+  if (path === "/connect" || path === "/disconnect") return connectLimiter;
+  if (
+    path === "/jobs" ||
+    path.endsWith("/retry-failed") ||
+    path.startsWith("/drafts/") ||
+    path === "/drafts/approve-all"
+  ) {
+    return spendLimiter;
+  }
+  return mutationLimiter;
+}
+
+/**
+ * Client identity for rate limiting. X-Forwarded-For is only honoured when the
+ * operator opted in via TRUST_PROXY; otherwise any client could spoof the
+ * header and get a fresh bucket per request.
+ */
+export function clientKey(req: Request): string {
+  if (TRUST_PROXY) {
+    const forwarded = req.get("x-forwarded-for");
+    const first = forwarded?.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  return req.socket.remoteAddress ?? "unknown";
+}
+
+/* -------------------------------------------------------------------- */
+/* Admin authentication                                                  */
+/* -------------------------------------------------------------------- */
+
+/** Constant-time compare that never throws on a length mismatch. */
+export function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Optional shared-secret gate for the admin API.
+ *
+ * The per-process CSRF token is handed out by GET /api/status, so it stops a
+ * cross-site page but not anyone who can reach the port — binding to 127.0.0.1
+ * is a deployment convention, not access control. When ADMIN_TOKEN is set every
+ * /api call must present it; when it is unset the previous behaviour is kept
+ * and boot logs a warning, because forcing a token on an existing install would
+ * lock the merchant out of their own panel on upgrade.
+ */
+export function readAdminToken(
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  const raw = env["ADMIN_TOKEN"]?.trim();
+  return raw ? raw : undefined;
+}
+
+/** Extract the presented admin token from either accepted header form. */
+export function presentedAdminToken(req: Request): string | undefined {
+  const bearer = req.get("authorization");
+  if (bearer && /^Bearer\s+/i.test(bearer)) {
+    const value = bearer.replace(/^Bearer\s+/i, "").trim();
+    if (value) return value;
+  }
+  const header = req.get("x-admin-token")?.trim();
+  return header ? header : undefined;
+}
+
 const TERMINAL_STATUSES: readonly JobStatus[] = [
   "completed",
   "completed_with_errors",
@@ -60,9 +171,27 @@ const TERMINAL_STATUSES: readonly JobStatus[] = [
   "cancelled",
 ];
 
+/**
+ * Encryption key for the credential store. There is deliberately no fallback:
+ * a default would encrypt every merchant's Shoper password and FOTOhub key
+ * with a constant that ships in this public repository, which is the same as
+ * storing them in plain text. Refusing to boot is the safe failure.
+ */
+function requireConfigSecret(): string {
+  const secret = process.env["FOTOHUB_CONFIG_SECRET"];
+  if (!secret || secret.trim().length < 16) {
+    throw new Error(
+      "FOTOHUB_CONFIG_SECRET must be set to at least 16 characters. " +
+        "It encrypts stored store credentials. Generate one with: " +
+        "openssl rand -hex 32"
+    );
+  }
+  return secret;
+}
+
 const store = new DraftStore(
   join(DATA_DIR, "fotohub-shoper.sqlite"),
-  process.env["FOTOHUB_CONFIG_SECRET"] ?? "fotohub-shoper-dev-secret"
+  requireConfigSecret()
 );
 
 /**
@@ -158,7 +287,25 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(PUBLIC_DIR));
 
-// CSRF guard for every state-changing /api call.
+/**
+ * Shared-secret gate. Runs before CSRF so an unauthenticated caller learns
+ * nothing about the panel's state, not even whether a store is connected.
+ */
+app.use("/api", (req: Request, res: Response, next: NextFunction) => {
+  const expected = readAdminToken();
+  if (!expected) {
+    next();
+    return;
+  }
+  const presented = presentedAdminToken(req);
+  if (!presented || !safeEqual(presented, expected)) {
+    res.status(401).json({ error: "admin_token_invalid" });
+    return;
+  }
+  next();
+});
+
+// CSRF guard plus per-IP throttle for every state-changing /api call.
 app.use("/api", (req: Request, res: Response, next: NextFunction) => {
   if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
     next();
@@ -166,6 +313,16 @@ app.use("/api", (req: Request, res: Response, next: NextFunction) => {
   }
   if (req.get("x-csrf-token") !== CSRF_TOKEN) {
     res.status(403).json({ error: "csrf_token_invalid" });
+    return;
+  }
+  // req.path is relative to this mount point, so it excludes the /api prefix.
+  const verdict = limiterFor(req.path).hit(clientKey(req));
+  if (!verdict.allowed) {
+    const retryAfterSeconds = Math.max(1, Math.ceil(verdict.resetMs / 1000));
+    res
+      .status(429)
+      .set("Retry-After", String(retryAfterSeconds))
+      .json({ error: "rate_limited", retry_after_ms: verdict.resetMs });
     return;
   }
   next();
@@ -572,6 +729,84 @@ app.post(
 
 /* ---- 5 + 6. Job submit & progress -------------------------------------------- */
 
+/** The slice of ShoperClient the item builder needs, so tests can fake it. */
+export type JobItemSource = Pick<
+  ShoperClient,
+  | "getProduct"
+  | "toSummary"
+  | "translationLocale"
+  | "getProductImages"
+  | "imageUrl"
+  | "getProductVariants"
+>;
+
+/**
+ * Turn selected product ids into bridge job items.
+ *
+ * `includeVariants` folds each product's option combinations into
+ * product_context.variants, which is what lets a text model say "available in
+ * 42/43/44" instead of inventing sizes. It is opt-in because it costs one extra
+ * /product-stocks call per product.
+ */
+export async function buildJobItems(
+  shoper: JobItemSource,
+  kind: JobKind,
+  productIds: readonly number[],
+  options: { includeVariants?: boolean } = {}
+): Promise<JobItemInput[]> {
+  const items: JobItemInput[] = [];
+  for (const productId of productIds) {
+    const product = await shoper.getProduct(productId);
+    const summary = shoper.toSummary(product);
+    const translations = product.translations as
+      | Record<string, ShoperProductTranslation>
+      | undefined;
+    const t =
+      translations?.[shoper.translationLocale] ??
+      (translations ? Object.values(translations)[0] : undefined);
+
+    const attributes: Record<string, string> = {};
+    if (product.ean) attributes["ean"] = String(product.ean);
+    if (product.code) attributes["code"] = String(product.code);
+
+    const context: ProductContext = {
+      title: summary.name,
+      category:
+        summary.category_id !== undefined ? String(summary.category_id) : undefined,
+      attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
+      price: summary.price,
+      current_description: t?.description ? String(t.description) : undefined,
+    };
+
+    if (options.includeVariants) {
+      // A store with no variants must not fail the whole submission, so a
+      // failed/empty lookup simply leaves the field off.
+      const variants = await shoper.getProductVariants(productId).catch(() => []);
+      const active = variants.filter((v) => v.active !== false);
+      const summaries = summariseVariants(active.length > 0 ? active : variants);
+      if (summaries.length > 0) context.variants = summaries;
+    }
+
+    // First visible product image as the source for image jobs.
+    let sourceImageUrl: string | undefined;
+    if (kind !== "description" && kind !== "alt_text") {
+      const images = await shoper.getProductImages(productId);
+      const main =
+        images.find((i) => i.main === "1" || i.main === 1 || i.main === true) ??
+        images[0];
+      sourceImageUrl = main ? shoper.imageUrl(main) : undefined;
+    }
+
+    items.push({
+      external_id: String(productId),
+      sku: summary.sku,
+      source_image_url: sourceImageUrl,
+      product_context: context,
+    });
+  }
+  return items;
+}
+
 app.post(
   "/api/jobs",
   wrap(async (req) => {
@@ -582,6 +817,7 @@ app.post(
       preset_slug?: string;
       options?: JobOptions;
       idempotency_key?: string;
+      include_variants?: boolean;
     };
     if (!b.kind) throw new HttpError(400, "kind is required");
     if (!Array.isArray(b.product_ids) || b.product_ids.length === 0) {
@@ -590,49 +826,11 @@ app.post(
 
     const connectionId = requireConnectionId();
     const shoper = makeShoper();
+    const includeVariants = b.include_variants === true;
 
-    // Build items with real product_context from the store.
-    const items: JobItemInput[] = [];
-    for (const productId of b.product_ids) {
-      const product = await shoper.getProduct(productId);
-      const summary = shoper.toSummary(product);
-      const translations = product.translations as
-        | Record<string, ShoperProductTranslation>
-        | undefined;
-      const t =
-        translations?.[shoper.translationLocale] ??
-        (translations ? Object.values(translations)[0] : undefined);
-
-      const attributes: Record<string, string> = {};
-      if (product.ean) attributes["ean"] = String(product.ean);
-      if (product.code) attributes["code"] = String(product.code);
-
-      const context: ProductContext = {
-        title: summary.name,
-        category:
-          summary.category_id !== undefined ? String(summary.category_id) : undefined,
-        attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
-        price: summary.price,
-        current_description: t?.description ? String(t.description) : undefined,
-      };
-
-      // First visible product image as the source for image jobs.
-      let sourceImageUrl: string | undefined;
-      if (b.kind !== "description" && b.kind !== "alt_text") {
-        const images = await shoper.getProductImages(productId);
-        const main =
-          images.find((i) => i.main === "1" || i.main === 1 || i.main === true) ??
-          images[0];
-        sourceImageUrl = main ? shoper.imageUrl(main) : undefined;
-      }
-
-      items.push({
-        external_id: String(productId),
-        sku: summary.sku,
-        source_image_url: sourceImageUrl,
-        product_context: context,
-      });
-    }
+    const items = await buildJobItems(shoper, b.kind, b.product_ids, {
+      includeVariants,
+    });
 
     const created = await makeBridge().createJob({
       connection_id: connectionId,
@@ -837,6 +1035,12 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     res.status(err.status).json({ error: err.message });
     return;
   }
+  // A 403 from Shoper is the merchant's own permission setup, not our bug, so
+  // it keeps its status instead of being flattened into a 500.
+  if (err instanceof ShoperPermissionError) {
+    res.status(403).json({ error: "shoper_insufficient_permission", detail: err.message });
+    return;
+  }
   console.error("[fotohub-shoper] unhandled error:", err);
   res
     .status(500)
@@ -847,7 +1051,34 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 /* Boot                                                                  */
 /* -------------------------------------------------------------------- */
 
+/**
+ * Warn loudly when the panel is reachable without a shared secret. Split out so
+ * a test can assert the warning fires without booting a listener.
+ */
+export function adminAuthBootMessage(
+  env: NodeJS.ProcessEnv = process.env
+): { level: "info" | "warn"; message: string } {
+  if (readAdminToken(env)) {
+    return { level: "info", message: "ADMIN_TOKEN is set — /api requires it." };
+  }
+  const host = env["HOST"] ?? "127.0.0.1";
+  const exposed = host !== "127.0.0.1" && host !== "localhost";
+  return {
+    level: "warn",
+    message:
+      "ADMIN_TOKEN is not set — the admin panel is UNAUTHENTICATED. Anyone who " +
+      `can reach ${host}:${env["PORT"] ?? PORT} can drive every /api route, ` +
+      "including spending FOTOhub credits and writing to the live store." +
+      (exposed
+        ? " HOST is not loopback, so this port may be reachable from the network."
+        : " Keep HOST on loopback, or set ADMIN_TOKEN."),
+  };
+}
+
 if (require.main === module) {
+  const boot = adminAuthBootMessage();
+  if (boot.level === "warn") console.warn(`[fotohub-shoper] ${boot.message}`);
+  else console.log(`[fotohub-shoper] ${boot.message}`);
   app.listen(PORT, HOST, () => {
     console.log(`FOTOhub AI for Shoper: http://${HOST}:${PORT}`);
   });

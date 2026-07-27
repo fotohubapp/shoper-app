@@ -919,11 +919,23 @@ export class ShoperApiError extends Error {
   }
 }
 
-/** 401/403 — token rejected or missing permissions. */
+/** 401 — token missing, expired or rejected. Re-authentication may help. */
 export class ShoperAuthError extends ShoperApiError {
   constructor(message: string, status = 401, body?: unknown) {
     super(message, status, body);
     this.name = "ShoperAuthError";
+  }
+}
+
+/**
+ * 403 — the token is valid but the webapi user may not touch this resource.
+ * Kept separate from ShoperAuthError because the remedy is different: granting
+ * the missing permission in the Shoper admin, not refreshing a token.
+ */
+export class ShoperPermissionError extends ShoperApiError {
+  constructor(message: string, body?: unknown) {
+    super(message, 403, body);
+    this.name = "ShoperPermissionError";
   }
 }
 

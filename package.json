@@ -2,13 +2,19 @@
   "name": "@fotohub/shoper-app",
   "version": "1.0.0",
   "description": "FOTOhub AI dla Shoper — masowe generowanie zdjęć produktowych, usuwanie tła, opisy AI, workflow szkiców (draft-first), oparty o FOTOhub commerce-bridge / FOTOhub AI for Shoper — bulk product photo generation, background removal, AI copywriting, draft-first review workflow",
-  "main": "dist/server.js",
-  "types": "dist/server.d.ts",
+  "bin": {
+    "fotohub-shoper": "dist/server.js"
+  },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist dist-typecheck",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "start": "node dist/server.js",
-    "dev": "tsc && node dist/server.js"
+    "dev": "tsc && node dist/server.js",
+    "verify": "npm run typecheck && npm run test",
+    "prepublishOnly": "npm run clean && npm run verify && npm run build"
   },
   "license": "MIT",
   "engines": {
@@ -23,7 +29,9 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^4.17.25",
     "@types/node": "^20.19.43",
-    "typescript": "^5.9.3"
+    "jsdom": "^29.1.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
   },
   "repository": {
     "type": "git",
@@ -48,6 +56,7 @@
   "files": [
     "dist",
     "public",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

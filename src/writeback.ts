@@ -223,11 +223,14 @@ export async function downloadImage(
     );
   }
 
-  const sniffed = sniffImageMime(buffer);
-  const contentType = sniffed ?? declared;
+  // The bytes decide, not the header. Falling back to the declared type when
+  // sniffing fails would let a server label anything image/png and have it
+  // uploaded to the merchant's gallery, which is the exact case the sniff
+  // exists to catch.
+  const contentType = sniffImageMime(buffer);
   if (!contentType || !allowedMime.includes(contentType)) {
     throw new ImageFetchError(
-      `Downloaded bytes are not a supported image (${contentType || "unknown"})`,
+      `Downloaded bytes are not a supported image (${contentType ?? declared ?? "unknown"})`,
       "bad_mime"
     );
   }

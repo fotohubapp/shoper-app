@@ -350,6 +350,19 @@
     </header>
 
     <div id="view-root" class="view-root"></div>
+
+    <!-- Job options that apply to every kind. The variant toggle lives here
+         rather than in opts-image/opts-text because it changes the product
+         context sent for both photo and copy jobs. -->
+    <fieldset id="opts-common" class="opts-text">
+      <label class="field" for="o-include-variants">
+        <span>
+          <input type="checkbox" id="o-include-variants">
+          <span data-i18n="option_include_variants">Uwzględnij warianty produktu</span>
+        </span>
+        <small data-i18n="option_include_variants_help"></small>
+      </label>
+    </fieldset>
   </main>
 </div>
 
